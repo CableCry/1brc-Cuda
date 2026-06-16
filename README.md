@@ -11,6 +11,8 @@ a lot about GPU programming through this :)
 
 ## Build and run
 
+Before running go to the cuda-oxide repo and setup your environment.
+
 ```
 cargo oxide run
 ```
