@@ -26,7 +26,7 @@ Place the measurement file at `./1brc/measurements.txt` before running.
 | [Baseline — nsys profiling](#nsys-profiling--figuring-out-where-time-actually-goes) | 0.527s | 1.362s | 1.889s | — |
 | [Attempt 1 — slot lookup cache](#attempt-1--slot-lookup-cache-made-it-worse) | 0.685s | 1.362s | 2.047s | **-30%** ↓ |
 | [Attempt 2 — block-level aggregation](#attempt-2--block-level-shared-memory-aggregation-current) | 0.492s | 1.362s | 1.854s | +6.6% |
-| [Attempt 2 — best observed](#attempt-2--block-level-shared-memory-aggregation-current) | 0.459s | 1.362s | 1.821s | +12.9% |
+| [Attempt 2 — shared tables](#attempt-2--block-level-shared-memory-aggregation-current) | 0.459s | 1.362s | 1.821s | +12.9% |
 | [Attempt 3 — table sharding (4 tables)](#attempt-3--table-sharding-across-4-independent-hash-tables) | 0.426s | 1.362s | 1.788s | **+19.2%** |
 
 \* H2D varies with OS page cache warmth (cold cache: 10–16s, warm: ~1.4s). Best observed used throughout for kernel comparison clarity.
@@ -170,7 +170,7 @@ run. That's not what's taking time. The 4 billion aggregate atomics (`fetch_add`
 table to verify a hit, which is its own global memory access on every row. Net result: more
 work, slower kernel.
 
-### Attempt 2 — block-level shared memory aggregation (current)
+### Attempt 2 — block-level shared memory aggregation
 
 The correct thing to reduce is the aggregate atomics, not the slot lookup. The idea: instead of
 hitting global memory 4 times per row, accumulate into shared memory within each block and
