@@ -31,7 +31,7 @@ Place the measurement file at `./1brc/measurements.txt` before running.
 
 \* H2D varies with OS page cache warmth (cold cache: 10–16s, warm: ~1.4s). Best observed used throughout for kernel comparison clarity.
 
-**Spoiler-alert its not the H2D demolishes the times**
+**Spoiler-alert its the H2D that demolishes times**
 
 
 ## Design
