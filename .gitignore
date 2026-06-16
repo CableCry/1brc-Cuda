@@ -1,0 +1,6 @@
+target/
+.oxide-artifacts/
+notes.md
+*.ll
+*.ptx
+1brc/
