@@ -15,8 +15,7 @@ const LOCAL_SIZE: usize = 1 << 11; // 2048 slots × 24 B = 48 KB, the static sha
 mod kernels {
     use super::*;
 
-    // as_ptr() on SharedArray needs &self, which Rust 2024 bans on static mut.
-    // Safe here because each block has its own copy of shared memory.
+    // Each block owns its shared memory, so the static-mut aliasing is safe.
     #[allow(static_mut_refs)]
     #[kernel]
     pub fn process_measurements(
@@ -28,7 +27,7 @@ mod kernels {
         table_mins: *mut i32,
         table_maxs: *mut i32,
     ) {
-        // Per-block shared memory aggregation table. Stays on-chip until the flush.
+        // Per-block shared aggregation table; flushed to global at the end.
         static mut SH_SLOTS: SharedArray<i32, LOCAL_SIZE> = SharedArray::UNINIT;
         static mut SH_SUMS: SharedArray<i64, LOCAL_SIZE> = SharedArray::UNINIT;
         static mut SH_CNTS: SharedArray<i32, LOCAL_SIZE> = SharedArray::UNINIT;
@@ -38,7 +37,7 @@ mod kernels {
         let local_tid = thread::threadIdx_x() as usize;
         let block_size = thread::blockDim_x() as usize;
 
-        // All 256 threads cooperatively stride through the shared arrays to init them.
+        // Cooperatively init the shared arrays.
         let mut i = local_tid;
         while i < LOCAL_SIZE {
             unsafe {
@@ -52,15 +51,14 @@ mod kernels {
         }
         thread::sync_threads();
 
-        // as_ptr() returns the shared memory base address so we can do pointer arithmetic.
+        // Base pointers for arithmetic.
         let sh_slots = unsafe { SH_SLOTS.as_ptr() as *mut i32 };
         let sh_sums = unsafe { SH_SUMS.as_ptr() as *mut i64 };
         let sh_cnts = unsafe { SH_CNTS.as_ptr() as *mut i32 };
         let sh_mins = unsafe { SH_MINS.as_ptr() as *mut i32 };
         let sh_maxs = unsafe { SH_MAXS.as_ptr() as *mut i32 };
 
-        // Shard across NUM_TABLES independent hash tables to reduce atomic contention.
-        // Blocks assigned to different tables never contend with each other.
+        // Shard across NUM_TABLES tables to cut atomic contention between blocks.
         let table_id = (thread::blockIdx_x() % NUM_TABLES as u32) as usize;
         let tbl_name_lens = unsafe { table_name_lens.add(table_id * TABLE_SIZE) };
         let tbl_names = unsafe { table_names.add(table_id * TABLE_SIZE * NAME_MAX) };
@@ -76,7 +74,7 @@ mod kernels {
         let start = tid * chunk;
         let end = ((tid + 1) * chunk).min(total);
 
-        // Threads with no work still need to reach the sync_threads() below.
+        // Idle threads still must reach the sync_threads() below.
         if start < total {
             if let Some(mut pos) = line_start(raw_text, tid, start, total) {
                 while pos < end {
@@ -92,8 +90,7 @@ mod kernels {
                     let slot_atom = unsafe { DeviceAtomicI32::from_ptr(sh_slots.add(local_slot)) };
                     let stored = slot_atom.load(AtomicOrdering::Acquire);
 
-                    // Try to use the shared memory slot. Claim it if empty, use it if ours,
-                    // fall back to global if a different station already owns it.
+                    // Use the shared slot: claim if empty, reuse if ours, else go global.
                     let use_local = if stored == global_slot as i32 {
                         true
                     } else if stored == -1 {
@@ -138,7 +135,7 @@ mod kernels {
 
         thread::sync_threads();
 
-        // Flush shared memory aggregates to global, one slot per occupied entry.
+        // Flush occupied shared slots to global.
         let mut i = local_tid;
         while i < LOCAL_SIZE {
             let gs = unsafe { *sh_slots.add(i) };
@@ -198,8 +195,8 @@ mod kernels {
         }
     }
 
-    // table_name_lens uses three sentinel values: 0 = empty, -1 = being written, >0 = name length.
-    // CAS(0 → -1) claims a slot; the writer stores the real length after copying the name bytes.
+    // table_name_lens sentinels: 0 = empty, -1 = being written, >0 = name length.
+    // CAS(0 → -1) claims a slot; the length is stored after the name bytes are copied.
     fn find_or_claim_slot(
         name: &[u8],
         h: usize,
@@ -231,7 +228,7 @@ mod kernels {
                     }
                     slot = (slot + 1) & (TABLE_SIZE - 1);
                 }
-                -1 => {} // another thread is writing this slot, spin
+                -1 => {} // being written, spin
                 _ => slot = (slot + 1) & (TABLE_SIZE - 1),
             }
         }
@@ -260,7 +257,7 @@ mod kernels {
         Some((sep.min(NAME_MAX), temp, sep + 1 + consumed))
     }
 
-    // Parses "-12.3\n" → (-123, 6). Value is stored as integer tenths to avoid floats.
+    // "-12.3\n" → (-123, 6); integer tenths, no floats.
     fn parse_temp(text: &[u8]) -> Option<(i16, usize)> {
         let mut i = 0;
         let neg = !text.is_empty() && text[0] == b'-';
@@ -289,6 +286,59 @@ mod kernels {
     }
 }
 
+// Split into chunks aligned to newline boundaries so no record straddles a seam.
+fn line_chunks(data: &[u8], target: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    let n = data.len();
+    let mut start = 0;
+    while start < n {
+        let mut end = (start + target).min(n);
+        if end < n {
+            // Back up to the last newline.
+            while end > start && data[end - 1] != b'\n' {
+                end -= 1;
+            }
+            if end == start {
+                // No newline in range (one huge line); extend forward.
+                end = (start + target).min(n);
+                while end < n && data[end - 1] != b'\n' {
+                    end += 1;
+                }
+            }
+        }
+        chunks.push((start, end));
+        start = end;
+    }
+    chunks
+}
+
+// Fault the mmap in parallel so the disk gets a deep request queue instead of one
+// sequential fault stream. One byte per 4 KB page forces it resident; on a warm
+// cache this is just a cheap scan.
+fn prefault(data: &[u8], threads: usize) {
+    let n = data.len();
+    let band = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let start = t * band;
+            let end = (start + band).min(n);
+            if start >= end {
+                break;
+            }
+            let slice = &data[start..end];
+            s.spawn(move || {
+                let mut acc: u8 = 0;
+                let mut i = 0;
+                while i < slice.len() {
+                    acc = acc.wrapping_add(slice[i]);
+                    i += 4096;
+                }
+                std::hint::black_box(acc);
+            });
+        }
+    });
+}
+
 fn fmt_val(tenths: i32) -> String {
     let sign = if tenths < 0 { "-" } else { "" };
     let abs = tenths.unsigned_abs();
@@ -303,55 +353,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_total = std::time::Instant::now();
 
     let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
+    let s0 = ctx.default_stream();
 
-    let t0 = std::time::Instant::now();
     let file = std::fs::File::open("./1brc/measurements.txt")?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let text_dev = DeviceBuffer::from_host(&stream, &mmap[..])?;
-    let total_slots = TABLE_SIZE * NUM_TABLES;
-    let name_lens_dev = DeviceBuffer::<i32>::zeroed(&stream, total_slots)?;
-    let names_dev = DeviceBuffer::<u8>::zeroed(&stream, total_slots * NAME_MAX)?;
-    let sums_dev = DeviceBuffer::<i64>::zeroed(&stream, total_slots)?;
-    let cnts_dev = DeviceBuffer::<i32>::zeroed(&stream, total_slots)?;
-    let mins_dev = DeviceBuffer::from_host(&stream, &vec![i32::MAX; total_slots])?;
-    let maxs_dev = DeviceBuffer::from_host(&stream, &vec![i32::MIN; total_slots])?;
-    stream.synchronize()?;
-    eprintln!("H2D transfer:  {:>8.3}s", t0.elapsed().as_secs_f64());
 
-    let t1 = std::time::Instant::now();
+    // PREFAULT_THREADS overrides the thread count; 0 disables prefault.
+    const NUM_OF_THREADS: usize = 16;
+    let prefault_threads: usize = std::env::var("PREFAULT_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(NUM_OF_THREADS);
+    let t_disk = std::time::Instant::now();
+    if prefault_threads > 0 {
+        prefault(&mmap[..], prefault_threads);
+    }
+    eprintln!(
+        "Disk read:     {:>8.3}s  ({prefault_threads} threads)",
+        t_disk.elapsed().as_secs_f64()
+    );
+
+    let t0 = std::time::Instant::now();
+
+    // Aggregation state, allocated once and accumulated across all chunks via atomics.
+    // Init on s0 before forking s1 so the inits are visible to s1's kernels.
+    let total_slots = TABLE_SIZE * NUM_TABLES;
+    let name_lens_dev = DeviceBuffer::<i32>::zeroed(&s0, total_slots)?;
+    let names_dev = DeviceBuffer::<u8>::zeroed(&s0, total_slots * NAME_MAX)?;
+    let sums_dev = DeviceBuffer::<i64>::zeroed(&s0, total_slots)?;
+    let cnts_dev = DeviceBuffer::<i32>::zeroed(&s0, total_slots)?;
+    let mins_dev = DeviceBuffer::from_host(&s0, &vec![i32::MAX; total_slots])?;
+    let maxs_dev = DeviceBuffer::from_host(&s0, &vec![i32::MIN; total_slots])?;
+
+    // s1 runs concurrently, after s0's inits.
+    let s1 = s0.fork()?;
+    let streams = [&s0, &s1];
+
     let module = kernels::load(&ctx)?;
     let config = LaunchConfig {
         grid_dim: (NUM_BLOCKS, 1, 1),
         block_dim: (BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
-    module.process_measurements(
-        &stream,
-        config,
-        &text_dev,
-        name_lens_dev.cu_deviceptr() as *mut i32,
-        names_dev.cu_deviceptr() as *mut u8,
-        sums_dev.cu_deviceptr() as *mut i64,
-        cnts_dev.cu_deviceptr() as *mut i32,
-        mins_dev.cu_deviceptr() as *mut i32,
-        maxs_dev.cu_deviceptr() as *mut i32,
-    )?;
-    stream.synchronize()?;
-    eprintln!("Kernel:        {:>8.3}s", t1.elapsed().as_secs_f64());
+
+    // CHUNK_MB sets the per-chunk read size (default 256 MB).
+    const CHUNK_MB: usize = 256;
+    let chunk_mb: usize = std::env::var("CHUNK_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CHUNK_MB);
+    let chunks = line_chunks(&mmap, chunk_mb << 20);
+    eprintln!("chunk size:    {chunk_mb} MB  ({} chunks)", chunks.len());
+
+    // Keep every chunk's buffer alive: dropping one mid-loop calls cuMemFree, which
+    // synchronizes the whole device and kills the overlap. They free together at the end.
+    let mut keep_alive = Vec::with_capacity(chunks.len());
+
+    for (i, &(start, end)) in chunks.iter().enumerate() {
+        let stream = streams[i % 2];
+        // This chunk's H2D overlaps the other stream's kernel; no sync between chunks.
+        let text_dev = DeviceBuffer::from_host(stream, &mmap[start..end])?;
+        module.process_measurements(
+            stream,
+            config,
+            &text_dev,
+            name_lens_dev.cu_deviceptr() as *mut i32,
+            names_dev.cu_deviceptr() as *mut u8,
+            sums_dev.cu_deviceptr() as *mut i64,
+            cnts_dev.cu_deviceptr() as *mut i32,
+            mins_dev.cu_deviceptr() as *mut i32,
+            maxs_dev.cu_deviceptr() as *mut i32,
+        )?;
+        keep_alive.push(text_dev);
+    }
+
+    s0.synchronize()?;
+    s1.synchronize()?;
+    eprintln!("Pipeline:      {:>8.3}s", t0.elapsed().as_secs_f64());
 
     let t2 = std::time::Instant::now();
-    let name_lens = name_lens_dev.to_host_vec(&stream)?;
-    let names = names_dev.to_host_vec(&stream)?;
-    let sums = sums_dev.to_host_vec(&stream)?;
-    let cnts = cnts_dev.to_host_vec(&stream)?;
-    let mins = mins_dev.to_host_vec(&stream)?;
-    let maxs = maxs_dev.to_host_vec(&stream)?;
+    let name_lens = name_lens_dev.to_host_vec(&s0)?;
+    let names = names_dev.to_host_vec(&s0)?;
+    let sums = sums_dev.to_host_vec(&s0)?;
+    let cnts = cnts_dev.to_host_vec(&s0)?;
+    let mins = mins_dev.to_host_vec(&s0)?;
+    let maxs = maxs_dev.to_host_vec(&s0)?;
     eprintln!("D2H transfer:  {:>8.3}s", t2.elapsed().as_secs_f64());
 
     let t3 = std::time::Instant::now();
 
-    // Each of the NUM_TABLES tables holds a partial result. Combine them on the CPU.
+    // Combine the NUM_TABLES partial tables on the CPU.
     let mut station_map: std::collections::HashMap<String, (i32, i32, i64, i32)> =
         std::collections::HashMap::with_capacity(10_000);
 
@@ -398,4 +489,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Total:         {:>8.3}s", t_total.elapsed().as_secs_f64());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mem_speed() -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+
+        let t_read = std::time::Instant::now();
+        let data = std::fs::read("./1brc/measurements.txt")?; // forces the full disk read now
+        eprintln!("disk read:   {:>8.3}s", t_read.elapsed().as_secs_f64());
+
+        let t_copy = std::time::Instant::now();
+        let text_dev = DeviceBuffer::from_host(&stream, &data)?;
+        stream.synchronize()?;
+        eprintln!("H2D only:    {:>8.3}s", t_copy.elapsed().as_secs_f64());
+        Ok(())
+    }
 }

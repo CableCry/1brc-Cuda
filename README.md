@@ -28,6 +28,7 @@ Place the measurement file at `./1brc/measurements.txt` before running.
 | [Attempt 2 — block-level aggregation](#attempt-2--block-level-shared-memory-aggregation-current) | 0.492s | 1.362s | 1.854s | +6.6% |
 | [Attempt 2 — shared tables](#attempt-2--block-level-shared-memory-aggregation-current) | 0.459s | 1.362s | 1.821s | +12.9% |
 | [Attempt 3 — table sharding (4 tables)](#attempt-3--table-sharding-across-4-independent-hash-tables) | 0.426s | 1.362s | 1.788s | **+19.2%** |
+| [Attempt 4 — two-stream H2D pipeline + parallel prefault](#attempt-4--two-stream-h2d-pipeline--parallel-prefault) | - | - | 1.491s | **+21.1%** |
 
 \* H2D varies with OS page cache warmth (cold cache: 10–16s, warm: ~1.4s). Best observed used throughout for kernel comparison clarity.
 
@@ -294,3 +295,43 @@ slowest thing in the kernel, adding more tables just adds overhead without remov
 For now, **~0.43s kernel on a 13 GB file** (1.79s total) is where this sits. Happy with it as a learning
 exercise in GPU atomics, shared memory limits, and contention patterns. If you've got ideas
 for pushing it further I'd love to hear them :)
+
+---
+
+## Attacking the H2D wall
+
+### Attempt 4 — two-stream H2D pipeline + parallel prefault
+
+The spoiler was right: H2D demolishes the kernel. With the kernel maxed out at ~0.43s, the warm
+total was still ~1.79s — almost all of it the 13 GB host→device transfer. Two changes, neither
+touching the kernel, go after that directly. Both help the warm number.
+
+**Overlapping H2D with the kernel.** The old path did one monolithic `from_host` of all 13 GB,
+blocked until it finished, *then* launched a single kernel — strictly serial, so warm total was
+H2D + kernel ≈ 1.36 + 0.43 ≈ 1.79s. Attempt 4 splits the mmap into ~256 MB newline-aligned
+chunks and round-robins them across two CUDA streams, so the H2D copy of chunk *i* runs
+concurrently with the kernel over chunk *i−1* on the other stream. The kernel time now hides
+underneath the transfer instead of stacking on top of it.
+
+**Parallel prefault.** Before the loop, 16 threads each touch one byte per 4 KB page across the
+whole mmap. On a warm cache this moves the page-cache touch work *off* the `from_host` critical
+path and does it in parallel up front, so each per-chunk copy is pure DMA of already-resident
+pages. This turned out to be the larger of the two warm wins.
+
+Together:
+
+```
+Total: 1.491s  (was 1.788s — ~17% faster warm, +21.1% vs baseline)
+```
+
+The six aggregation tables are allocated once and accumulated across every chunk via device
+atomics — never re-zeroed — so the two streams' kernels writing the same tables concurrently
+stay correct (the sharding from Attempt 3 is a contention optimization, not a correctness
+requirement). Each chunk's device buffer is parked in a `Vec` until the end: dropping one
+mid-loop calls `cuMemFree`, which synchronizes the whole device and would stall both streams and
+kill the overlap. The 13 GB fits in the 4090's 24 GB, so they all free together in one harmless
+stall after the final `synchronize()`. Output stays byte-identical to the serial version.
+
+The prefault's real payoff, though, is on a **cold** cache: the deep parallel request queue
+pulls a cold read from ~15.5s down to ~4s (≈3.9×, disk saturates around 16 threads on this WSL2
+volume) — the difference between waiting on one sequential fault stream and 16 concurrent ones.
